@@ -10,6 +10,12 @@ import { applyDry } from "./broker/dry.js";
 import { LiveBroker } from "./broker/live.js";
 import { logPen } from "./dryrun/log-pen.js";
 import { defaultPnLPath } from "./pnl/ledger.js";
+import {
+  buildSpecs,
+  parseCsvList,
+  DEFAULT_ASSET_IDS,
+  DEFAULT_TIMEFRAME_IDS,
+} from "./assets.js";
 import type {
   Judge,
   MarketSource,
@@ -25,10 +31,20 @@ export type EnvBag = {
   TICK_MS?: string;
   ACT_THRESHOLD?: string;
   BET_USD?: string;
+  BANKROLL_USD?: string;
+  KELLY_FRACTION?: string;
   MAX_ASK?: string;
+  MAX_SPREAD?: string;
   MIN_EDGE?: string;
   MIN_SECONDS_TO_ENTER?: string;
   MAX_ENTERS_PER_WINDOW?: string;
+  REQUIRE_TREND_HELD_SEC?: string;
+  MIN_VOL_PCT?: string;
+  TAKE_PROFIT_PRICE?: string;
+  ENFORCE_STRATEGY?: string;
+  REQUIRE_BIAS_AGREEMENT?: string;
+  ASSETS?: string;
+  TIMEFRAMES?: string;
   FIXTURE_PATH?: string;
   STALE_AFTER_MS?: string;
   LIVE_TRADING?: string;
@@ -90,6 +106,22 @@ export function loadConfig(
     1,
     Math.floor(num(e.MAX_ENTERS_PER_WINDOW, 1)),
   );
+  const bankrollUsd = Math.max(0, num(e.BANKROLL_USD, 100));
+  const kellyFraction = Math.min(1, Math.max(0, num(e.KELLY_FRACTION, 0.25)));
+  const maxSpread = Math.max(0, num(e.MAX_SPREAD, 0.02));
+  const requireTrendHeldSec = Math.max(
+    0,
+    Math.floor(num(e.REQUIRE_TREND_HELD_SEC, 60)),
+  );
+  const minVolPct = Math.max(0, num(e.MIN_VOL_PCT, 0.02));
+  const takeProfitPrice = Math.max(0, num(e.TAKE_PROFIT_PRICE, 0.9));
+  const envEnforce =
+    e.ENFORCE_STRATEGY !== "0" && e.ENFORCE_STRATEGY !== "false";
+  const requireBiasAgreement =
+    e.REQUIRE_BIAS_AGREEMENT !== "0" &&
+    e.REQUIRE_BIAS_AGREEMENT !== "false";
+  const assetIds = parseCsvList(e.ASSETS, DEFAULT_ASSET_IDS);
+  const timeframeIds = parseCsvList(e.TIMEFRAMES, DEFAULT_TIMEFRAME_IDS);
   const tickMs = num(e.TICK_MS, 5_000);
   const staleAfterMs = num(e.STALE_AFTER_MS, 120_000);
   const liveTrading = e.LIVE_TRADING === "1" || e.LIVE_TRADING === "true";
@@ -100,6 +132,15 @@ export function loadConfig(
     );
   }
   const pnlPath = resolve(e.PNL_PATH ?? defaultPnLPath());
+
+  const offline = Boolean(opts.stubJudge || opts.fixedSpot);
+  let specs = buildSpecs(assetIds, timeframeIds);
+  if (specs.length === 0) {
+    specs = buildSpecs(DEFAULT_ASSET_IDS, DEFAULT_TIMEFRAME_IDS);
+  }
+  // Offline smoke runs stay single-market so fixtures don't fan out.
+  if (offline) specs = specs.slice(0, 1);
+  const enforceStrategy = offline ? false : envEnforce;
 
   let judge: Judge;
   let spot: SpotSource;
@@ -163,18 +204,29 @@ export function loadConfig(
   }
 
   return {
+    specs,
     polymarket,
     spot,
     judge,
     pen,
     threshold: opts.overrides?.threshold ?? threshold,
     betUsd: opts.overrides?.betUsd ?? betUsd,
+    bankrollUsd: opts.overrides?.bankrollUsd ?? bankrollUsd,
+    kellyFraction: opts.overrides?.kellyFraction ?? kellyFraction,
     maxAsk: opts.overrides?.maxAsk ?? maxAsk,
+    maxSpread: opts.overrides?.maxSpread ?? maxSpread,
     minEdge: opts.overrides?.minEdge ?? minEdge,
     minSecondsToEnter:
       opts.overrides?.minSecondsToEnter ?? minSecondsToEnter,
     maxEntersPerWindow:
       opts.overrides?.maxEntersPerWindow ?? maxEntersPerWindow,
+    requireTrendHeldSec:
+      opts.overrides?.requireTrendHeldSec ?? requireTrendHeldSec,
+    minVolPct: opts.overrides?.minVolPct ?? minVolPct,
+    enforceStrategy: opts.overrides?.enforceStrategy ?? enforceStrategy,
+    requireBiasAgreement:
+      opts.overrides?.requireBiasAgreement ?? requireBiasAgreement,
+    takeProfitPrice: opts.overrides?.takeProfitPrice ?? takeProfitPrice,
     tickMs: opts.overrides?.tickMs ?? tickMs,
     staleAfterMs: opts.overrides?.staleAfterMs ?? staleAfterMs,
     windowLengthSec: opts.overrides?.windowLengthSec ?? 300,

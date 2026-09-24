@@ -5,6 +5,7 @@ import {
   type IsoTime,
   type Side,
 } from "../../domain.js";
+import { parseUpDownSlug } from "../../assets.js";
 
 export type GammaMarketWire = {
   question?: string;
@@ -37,8 +38,6 @@ export type ClobSideQuotes = {
   bestAsk: number | null;
 };
 
-const WINDOW_SEC = 300;
-
 function parseJsonArray(v: string | string[] | number[] | undefined): string[] {
   if (v == null) return [];
   if (Array.isArray(v)) return v.map(String);
@@ -63,10 +62,15 @@ function classifyOutcome(label: string): Side | null {
   return null;
 }
 
-/** Active Polymarket BTC Up/Down 5-minute window slug. */
-export function activeBtcUpDownSlug(nowMs = Date.now()): string {
-  const windowSec = Math.floor(nowMs / 1000 / WINDOW_SEC) * WINDOW_SEC;
-  return `btc-updown-5m-${windowSec}`;
+/** Active Polymarket Up/Down window slug for an asset + timeframe label. */
+export function activeUpDownSlug(
+  assetId: string,
+  timeframeLabel: string,
+  windowSec: number,
+  nowMs = Date.now(),
+): string {
+  const start = Math.floor(nowMs / 1000 / windowSec) * windowSec;
+  return `${assetId}-updown-${timeframeLabel}-${start}`;
 }
 
 export function secondsRemaining(
@@ -81,14 +85,13 @@ export function secondsRemaining(
   return Math.max(0, Math.floor((endMs - nowMs) / 1000));
 }
 
-/** Derive window end from `btc-updown-5m-{unixStart}` when Gamma omits endDate. */
+/** Derive window end from `<asset>-updown-<tf>-{unixStart}` when Gamma omits endDate. */
 export function endsAtFromSlug(slug: string): IsoTime | null {
-  const m = /btc-updown-(?:5m|15m)-(\d+)$/.exec(slug);
-  if (!m) return null;
-  const startSec = Number(m[1]);
-  if (!Number.isFinite(startSec)) return null;
-  const windowSec = slug.includes("-15m-") ? 900 : WINDOW_SEC;
-  return asIsoTime(new Date((startSec + windowSec) * 1000).toISOString());
+  const parts = parseUpDownSlug(slug);
+  if (!parts) return null;
+  return asIsoTime(
+    new Date((parts.windowStartSec + parts.windowSec) * 1000).toISOString(),
+  );
 }
 
 export function effectiveEndsAt(market: DomainMarket): IsoTime | null {
@@ -110,6 +113,8 @@ export function windowHasEnded(
  */
 export function shouldCloseWindow(args: {
   activeSlug: string | null;
+  /** Slug the traded spec should be on right now (null when unknown). */
+  expectedSlug?: string | null;
   position: { kind: "flat" } | { kind: "open"; slug: string };
   market: DomainMarket;
   now?: IsoTime | string | number;
@@ -122,9 +127,11 @@ export function shouldCloseWindow(args: {
   if (heldSlug != null && market.eventSlug !== heldSlug) {
     return true; // gamma already serving next window
   }
-  if (heldSlug != null && activeBtcUpDownSlug(
-    typeof now === "number" ? now : Date.parse(String(now)),
-  ) !== heldSlug) {
+  if (
+    heldSlug != null &&
+    args.expectedSlug != null &&
+    args.expectedSlug !== heldSlug
+  ) {
     return true; // wall clock rolled past held slug
   }
   if (heldSlug == null || market.eventSlug === heldSlug) {
@@ -246,10 +253,14 @@ export function domainMarketFromGamma(
   const endsAt = endsRaw
     ? asIsoTime(endsRaw)
     : endsAtFromSlug(eventSlug);
+  const parts = parseUpDownSlug(eventSlug);
 
   return {
     eventSlug,
-    question: market.question ?? event.title ?? "Bitcoin Up or Down",
+    assetId: parts?.assetId ?? null,
+    timeframeId: parts?.timeframeId ?? null,
+    windowSec: parts?.windowSec ?? null,
+    question: market.question ?? event.title ?? "Crypto Up or Down",
     conditionId: String(market.conditionId ?? market.condition_id ?? ""),
     endsAt,
     volume24hUsd: vol,
@@ -268,6 +279,9 @@ export function domainMarketFromDomainJson(raw: unknown): DomainMarket {
   }
   return {
     eventSlug: o.eventSlug,
+    assetId: o.assetId ?? parseUpDownSlug(o.eventSlug)?.assetId ?? null,
+    timeframeId: o.timeframeId ?? parseUpDownSlug(o.eventSlug)?.timeframeId ?? null,
+    windowSec: o.windowSec ?? parseUpDownSlug(o.eventSlug)?.windowSec ?? null,
     question: o.question,
     conditionId: o.conditionId,
     endsAt: o.endsAt ? asIsoTime(o.endsAt) : null,

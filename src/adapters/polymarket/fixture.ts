@@ -7,11 +7,12 @@ import {
   type MarketSource,
   type Sample,
 } from "../../domain.js";
+import type { MarketSpec } from "../../assets.js";
 import { domainMarketFromDomainJson } from "./wire.js";
 
 export function fixtureMarketSource(path: string): MarketSource {
   return {
-    async pullActiveBtcUpDown(): Promise<Sample<DomainMarket>> {
+    async pullActive(_spec: MarketSpec): Promise<Sample<DomainMarket>> {
       const abs = resolve(path);
       const raw = JSON.parse(await readFile(abs, "utf8")) as unknown;
       const value = domainMarketFromDomainJson(raw);
@@ -30,7 +31,7 @@ export class FixtureMarketSource implements MarketSource {
   constructor(path: string) {
     this.inner = fixtureMarketSource(path);
   }
-  pullActiveBtcUpDown(): Promise<Sample<DomainMarket>> {
-    return this.inner.pullActiveBtcUpDown();
+  pullActive(spec: MarketSpec): Promise<Sample<DomainMarket>> {
+    return this.inner.pullActive(spec);
   }
 }

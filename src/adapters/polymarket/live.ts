@@ -6,8 +6,8 @@ import {
   type MarketSource,
   type Sample,
 } from "../../domain.js";
+import { activeSlugForSpec, type MarketSpec } from "../../assets.js";
 import {
-  activeBtcUpDownSlug,
   domainMarketFromGamma,
   fetchJson,
   type ClobSideQuotes,
@@ -67,6 +67,23 @@ async function clobQuotes(tokenId: string): Promise<ClobSideQuotes> {
   return { mid, spread, lastTrade, bestBid, bestAsk };
 }
 
+/**
+ * Cheap quotes for scanning: one order-book call per token. Mid/spread are
+ * derived from top of book; lastTrade is left null (Gamma covers the fallback).
+ */
+async function clobQuotesLight(tokenId: string): Promise<ClobSideQuotes> {
+  const client = new ClobClient(CLOB_HOST, CHAIN_ID);
+  const bookR = await client.getOrderBook(tokenId).catch(() => null);
+  const { bestBid, bestAsk } = bestBidAskFromBook(bookR);
+  const mid =
+    bestBid != null && bestAsk != null
+      ? (bestBid + bestAsk) / 2
+      : bestBid ?? bestAsk ?? null;
+  const spread =
+    bestBid != null && bestAsk != null ? Math.max(0, bestAsk - bestBid) : null;
+  return { mid, spread, lastTrade: null, bestBid, bestAsk };
+}
+
 /** CLOB books are often worst-first. Take the actual top of book. */
 export function bestBidAskFromBook(book: unknown): {
   bestBid: number | null;
@@ -104,7 +121,10 @@ function priceLevels(raw: unknown): number[] {
   return out;
 }
 
-async function sampleForSlug(slug: string): Promise<Sample<DomainMarket>> {
+async function sampleForSlug(
+  slug: string,
+  light = false,
+): Promise<Sample<DomainMarket>> {
   const event = await resolveEvent(slug);
   const market = event.markets?.[0];
   if (!market) throw new Error("live gamma: empty markets");
@@ -124,7 +144,9 @@ async function sampleForSlug(slug: string): Promise<Sample<DomainMarket>> {
   const quotesByToken: Record<string, ClobSideQuotes> = {};
   await Promise.all(
     tokenIds.map(async (tid) => {
-      quotesByToken[tid] = await clobQuotes(tid);
+      quotesByToken[tid] = light
+        ? await clobQuotesLight(tid)
+        : await clobQuotes(tid);
     }),
   );
 
@@ -141,9 +163,10 @@ export function liveMarketSource(opts: {
   slugOverride?: string;
 }): MarketSource {
   return {
-    async pullActiveBtcUpDown(): Promise<Sample<DomainMarket>> {
-      const slug = opts.slugOverride ?? activeBtcUpDownSlug();
-      return sampleForSlug(slug);
+    async pullActive(spec: MarketSpec): Promise<Sample<DomainMarket>> {
+      const slug = opts.slugOverride ?? activeSlugForSpec(spec);
+      // Scanning pulls ~1 book call per token; settle path uses full quotes.
+      return sampleForSlug(slug, true);
     },
     async pullBySlug(slug: string): Promise<Sample<DomainMarket>> {
       return sampleForSlug(slug);

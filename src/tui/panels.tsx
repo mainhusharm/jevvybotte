@@ -163,7 +163,7 @@ export function TopBar({
         <Text color={G}> Prediction Market Trading Bot</Text>
         <Text color={G}> - </Text>
         <Text color={GB} bold>
-          POLYMARKET · BTC UP/DOWN 5M · {liveTrading ? "LIVE TRADING" : "DRY-RUN"}
+          POLYMARKET · CRYPTO UP/DOWN · {liveTrading ? "LIVE TRADING" : "DRY-RUN"}
         </Text>
       </Text>
       <Text>
@@ -223,7 +223,8 @@ export function MarketHeader({ snap }: { snap: TickSnapshot }): React.ReactEleme
             ₿{" "}
           </Text>
           <Text color={GB} bold>
-            BTC UP OR DOWN (5 MIN)
+            {m?.ticker ?? "BTC"} UP OR DOWN (
+            {m?.timeframeId?.toUpperCase() ?? "5M"})
           </Text>
           <Text color={G}>
             {"  "}Ends {ends} · {rem} left
@@ -232,7 +233,7 @@ export function MarketHeader({ snap }: { snap: TickSnapshot }): React.ReactEleme
         <Text color={G}>
           24H Vol {vol}
           {"  "}·{"  "}
-          BTC 24h{" "}
+          {m?.ticker ?? "BTC"} 24h{" "}
           <Text color={snap.btc && snap.btc.change24hPct >= 0 ? GB : RB} bold>
             {chg}
           </Text>
@@ -522,8 +523,12 @@ export function PositionPanel({
           <Text color={G}>Entry — · Size — · Unrealized —</Text>
         </>
       )}
-      <Text color={snap.cumulativePnLUsd >= 0 ? GB : RB} bold>
-        PnL (session): {snap.cumulativePnLUsd >= 0 ? "+" : ""}$
+      <Text color={snap.sessionPnLUsd >= 0 ? GB : RB} bold>
+        PnL (session): {snap.sessionPnLUsd >= 0 ? "+" : ""}$
+        {snap.sessionPnLUsd.toFixed(2)}
+      </Text>
+      <Text color={snap.cumulativePnLUsd >= 0 ? GB : RB} dimColor>
+        PnL (all-time): {snap.cumulativePnLUsd >= 0 ? "+" : ""}$
         {snap.cumulativePnLUsd.toFixed(2)}
       </Text>
     </Box>
@@ -606,19 +611,25 @@ export function DecisionsTable({
         RECENT DECISIONS
       </Text>
       <Text color={G} dimColor>
-        {"TIME     TICK  DECISION  CONF   ACTION"}
+        {"TIME     MKT       DECISION  CONF   ACTION"}
       </Text>
       {rows.length === 0 ? (
         <Text color={G} dimColor>
           empty
         </Text>
       ) : (
-        rows.map((d, i) => (
-          <Text key={`${d.tickId}-${i}`} color={G} dimColor>
-            {hhmmss(d.at)}  #{String(d.tickId).padStart(3, "0")}  {d.kind.padEnd(8)}{" "}
-            {d.conf != null ? d.conf.toFixed(3) : "  —  "}  {d.summary.slice(0, 28)}
-          </Text>
-        ))
+        rows.map((d, i) => {
+          const parts = d.marketSlug ? d.marketSlug.split("-") : [];
+          const mkt =
+            `${(d.assetId ?? parts[0] ?? "").toUpperCase()} ${d.timeframeId ?? parts[2] ?? ""}`.trim() ||
+            "—";
+          return (
+            <Text key={`${d.tickId}-${i}`} color={G} dimColor>
+              {hhmmss(d.at)}  {mkt.padEnd(8)}  {d.kind.padEnd(8)}{" "}
+              {d.conf != null ? d.conf.toFixed(3) : "  —  "}  {d.summary.slice(0, 20)}
+            </Text>
+          );
+        })
       )}
     </Box>
   );

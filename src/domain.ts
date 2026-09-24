@@ -1,3 +1,5 @@
+import type { MarketSpec } from "./assets.js";
+
 export type Confidence = number & { readonly __brand: "Confidence" };
 
 /**
@@ -43,6 +45,12 @@ export type Sample<T> = {
 
 export type DomainMarket = {
   eventSlug: string;
+  /** Slug-derived asset id ("btc"), null when unknown. */
+  assetId: string | null;
+  /** Slug-derived timeframe id ("5m"), null when unknown. */
+  timeframeId: string | null;
+  /** Window length in seconds, null when unknown. */
+  windowSec: number | null;
   question: string;
   conditionId: string;
   endsAt: IsoTime | null;
@@ -66,13 +74,60 @@ export type DomainMarket = {
 };
 
 export type SpotPulse = {
-  symbol: "BTCUSDT";
+  symbol: string;
   last: number;
   change24hPct: number;
   high24h: number;
   low24h: number;
   volume24hQuote: number;
   moveVsWindowOpenPct: number;
+  /** Price at the start of the active window (1m kline open), when known. */
+  windowOpen: number | null;
+  /** Recent 1m closes, oldest → newest, for momentum/volatility analysis. */
+  closes1m: number[];
+};
+
+/** Rule-based pre-JEV read of the current window (the "analyze" stage). */
+export type StrategyAnalysis = {
+  assetId: string;
+  timeframeId: string;
+  /** Seconds elapsed inside the current window. */
+  elapsedSec: number;
+  /** Short-horizon return in basis points (e.g. last 3 x 1m). */
+  momentumBps: number;
+  /** Return over the full window so far, in basis points. */
+  windowMoveBps: number;
+  /** Std-dev of 1m returns, in percent. */
+  volatilityPct: number;
+  /** Consecutive seconds the current direction has held. */
+  trendHeldSec: number;
+  /** Fair P(UP) from the rules-only model, 0..1. */
+  fairUp: number;
+  /** Rule-based side with the edge (or NEUTRAL when too weak). */
+  bias: Side | "NEUTRAL";
+  /** 0..1 confidence in the rule-based read. */
+  biasStrength: number;
+  /** Reasons the strategy says to sit this window out. */
+  skip: string[];
+  /** Human one-liner for JEV facts / logs. */
+  notes: string;
+};
+
+/** A scored market opportunity produced by the scanner. */
+export type ScanCandidate = {
+  specKey: string;
+  assetId: string;
+  ticker: string;
+  timeframeId: string;
+  slug: string;
+  ask: number;
+  fairUp: number;
+  /** Rule-based edge of the best side: P(best) - ask(best). */
+  edge: number;
+  side: Side;
+  eligible: boolean;
+  reasons: string[];
+  analysis: StrategyAnalysis;
 };
 
 export type ActorHealth =
@@ -102,6 +157,12 @@ export type IntendedOrder = {
   at: IsoTime;
   idempotencyKey: string;
   rationale: string;
+  /** Gamma event slug this order belongs to (for the Polymarket link). */
+  marketSlug?: string;
+  /** Slug-derived asset id ("btc"). */
+  assetId?: string;
+  /** Slug-derived timeframe id ("5m"). */
+  timeframeId?: string;
 };
 
 export type AbstainReason =
@@ -116,6 +177,8 @@ export type AbstainReason =
   | { code: "TOO_LATE"; detail: string }
   | { code: "COOLDOWN"; detail: string }
   | { code: "MAX_TRADES"; detail: string }
+  | { code: "STRATEGY_SKIP"; detail: string }
+  | { code: "WIDE_SPREAD"; detail: string }
   | { code: "WORLD_INCOMPLETE"; missing: ReadonlyArray<"market" | "spot"> }
   | { code: "JUDGE_FAILED"; message: string }
   | { code: "MARKET_UNAVAILABLE"; message: string }
@@ -131,7 +194,7 @@ export type TradeAction =
       kind: "EXIT";
       side: Side;
       order: IntendedOrder;
-      reason: "confidence_floor" | "window_end" | "switch";
+      reason: "confidence_floor" | "window_end" | "switch" | "take_profit";
       why: string;
     }
   | {
@@ -147,6 +210,10 @@ export type TradeAction =
 export type PnLRecord = {
   slug: string;
   settledAt: IsoTime;
+  /** Slug-derived asset id, when known. */
+  assetId?: string;
+  /** Slug-derived timeframe id, when known. */
+  timeframeId?: string;
   winner: Side | null;
   positionSide: Side | null;
   entryPrice: number | null;
@@ -175,20 +242,27 @@ export type FactsForJev = {
   market: {
     slug: string;
     question: string;
+    assetId: string | null;
+    assetName: string | null;
+    timeframeId: string | null;
     endsAt: string | null;
     volume24hUsd: number;
     up: QuoteSlice;
     down: QuoteSlice;
   };
-  btc: {
+  asset: {
+    symbol: string;
     last: number;
     change24hPct: number;
     high24h: number;
     low24h: number;
     volume24hQuote: number;
+    /** Move vs the window open reference, percent. */
     moveVsWindowOpenPct: number;
     windowOpen: number | null;
   };
+  /** Rules-based pre-JEV analysis (momentum, vol, held direction, skips). */
+  analysis: StrategyAnalysis;
   session: {
     secondsRemaining: number | null;
     windowLengthSec: number;
@@ -219,13 +293,18 @@ export type JudgeOpinion = {
 };
 
 export interface MarketSource {
-  pullActiveBtcUpDown(): Promise<Sample<DomainMarket>>;
+  /** Pull the active window for a given asset/timeframe spec. */
+  pullActive(spec: MarketSpec): Promise<Sample<DomainMarket>>;
   /** Optional: fetch a specific slug (for settle after rollover). */
   pullBySlug?(slug: string): Promise<Sample<DomainMarket>>;
 }
 
 export interface SpotSource {
-  pullBtcPulse(): Promise<Sample<SpotPulse>>;
+  /** Pull the latest spot pulse for a Binance symbol ("BTCUSDT"). */
+  pullPulse(
+    symbol: string,
+    opts?: { windowStartSec?: number },
+  ): Promise<Sample<SpotPulse>>;
 }
 
 export interface Judge {
@@ -248,22 +327,40 @@ export type OrderExecutor = {
 };
 
 export type SessionConfig = {
+  /** Enabled asset x timeframe windows to scan. */
+  specs: MarketSpec[];
   polymarket: MarketSource;
   spot: SpotSource;
   judge: Judge;
   pen: DryRunPen;
   /** ENTER only when conf > this (default 0.90). */
   threshold: number;
-  /** Max USD notional per ENTER. */
+  /** Base USD notional per ENTER before Kelly scaling. */
   betUsd: number;
+  /** Bankroll used for fractional-Kelly sizing (USD). */
+  bankrollUsd: number;
+  /** Fraction of full Kelly to bet (default 0.25). */
+  kellyFraction: number;
   /** Refuse ENTER if ask above this (default 0.70). */
   maxAsk: number;
+  /** Refuse ENTER if top-of-book spread above this (default 0.02). */
+  maxSpread: number;
   /** Require P(win) ≥ ask + minEdge (default 0.10). */
   minEdge: number;
   /** Abstain from new ENTER when fewer seconds remain (default 90). */
   minSecondsToEnter: number;
-  /** Max ENTER actions per 5m window (default 1 — ride to end). */
+  /** Require the post-open direction to have held this many seconds. */
+  requireTrendHeldSec: number;
+  /** Skip windows whose 1m volatility is below this percent. */
+  minVolPct: number;
+  /** Enforce analysis skip filters before asking JEV (off for stub runs). */
+  enforceStrategy: boolean;
+  /** Refuse ENTER when the JEV side fights the analysis bias. */
+  requireBiasAgreement: boolean;
+  /** Max ENTER actions per window (default 1 — ride to end). */
   maxEntersPerWindow: number;
+  /** Exit an open position once its bid reaches this price (0 disables). */
+  takeProfitPrice: number;
   tickMs: number;
   staleAfterMs: number;
   windowLengthSec: number;
@@ -288,6 +385,11 @@ export type TickSnapshot = {
   market: {
     slug: string;
     question: string;
+    assetId: string | null;
+    assetName: string | null;
+    ticker: string | null;
+    timeframeId: string | null;
+    windowSec: number | null;
     upMid: number;
     downMid: number;
     upBid: number | null;
@@ -316,10 +418,19 @@ export type TickSnapshot = {
     spot: ActorHealth;
   };
   factsPreview: FactsForJev | null;
+  /** Rule-based analysis for the focused (or best) window. */
+  analysis: StrategyAnalysis | null;
+  /** Scored opportunities across every enabled asset x timeframe. */
+  candidates: ReadonlyArray<ScanCandidate>;
   opinion: JudgeOpinion | null;
   lastOrder: IntendedOrder | null;
   intentLogTail: ReadonlyArray<IntendedOrder>;
   lastPnL: PnLRecord | null;
+  /** Settled trades this session (newest last), for order-result lookup. */
+  recentPnL: ReadonlyArray<PnLRecord>;
+  /** Realized PnL since this session started (ledger delta from boot). */
+  sessionPnLUsd: number;
+  /** Realized PnL across the whole ledger (all-time). */
   cumulativePnLUsd: number;
   /** Mark-to-market on open position (bid), null when flat. */
   unrealizedPnLUsd: number | null;
@@ -331,6 +442,9 @@ export type TickSnapshot = {
     summary: string;
     conf?: number;
     side?: Side;
+    marketSlug?: string;
+    assetId?: string;
+    timeframeId?: string;
   }>;
   /** Ring of recent API / tool activity (newest last). */
   activityLog: ReadonlyArray<{

@@ -6,6 +6,7 @@ import type {
   QuoteSlice,
   Sample,
   SpotPulse,
+  StrategyAnalysis,
 } from "./domain.js";
 import { secondsRemaining } from "./adapters/polymarket/wire.js";
 import { markBid } from "./policy.js";
@@ -28,6 +29,20 @@ function quoteSlice(
   };
 }
 
+/** Asset display name for prompts, from the slug-derived id. */
+export function assetDisplayName(assetId: string | null): string | null {
+  if (!assetId) return null;
+  const map: Record<string, string> = {
+    btc: "Bitcoin",
+    eth: "Ethereum",
+    sol: "Solana",
+    xrp: "XRP",
+    doge: "Dogecoin",
+    bnb: "BNB",
+  };
+  return map[assetId] ?? assetId.toUpperCase();
+}
+
 export function composeFacts(
   market: Sample<DomainMarket>,
   spot: Sample<SpotPulse>,
@@ -35,7 +50,8 @@ export function composeFacts(
   staleAfterMs: number,
   position: Position,
   windowLengthSec: number,
-  windowOpenBtc: number | null,
+  analysis: StrategyAnalysis,
+  windowOpenFallback: number | null,
 ):
   | { ok: true; facts: FactsForJev }
   | { ok: false; reason: "stale_inputs" | "actor_unhealthy"; detail: string } {
@@ -52,7 +68,12 @@ export function composeFacts(
 
   const m = market.value;
   const s = spot.value;
-  const openPx = windowOpenBtc != null && windowOpenBtc > 0 ? windowOpenBtc : null;
+  const openPx =
+    s.windowOpen != null && s.windowOpen > 0
+      ? s.windowOpen
+      : windowOpenFallback != null && windowOpenFallback > 0
+        ? windowOpenFallback
+        : null;
   const moveVsWindowOpenPct =
     openPx != null ? ((s.last - openPx) / openPx) * 100 : 0;
 
@@ -82,12 +103,16 @@ export function composeFacts(
     market: {
       slug: m.eventSlug,
       question: m.question,
+      assetId: m.assetId,
+      assetName: assetDisplayName(m.assetId),
+      timeframeId: m.timeframeId,
       endsAt: m.endsAt,
       volume24hUsd: m.volume24hUsd,
       up: quoteSlice(m, "UP"),
       down: quoteSlice(m, "DOWN"),
     },
-    btc: {
+    asset: {
+      symbol: s.symbol,
       last: s.last,
       change24hPct: s.change24hPct,
       high24h: s.high24h,
@@ -98,6 +123,7 @@ export function composeFacts(
         : 0,
       windowOpen: openPx,
     },
+    analysis,
     session: {
       secondsRemaining: secondsRemaining(m.endsAt, now),
       windowLengthSec,

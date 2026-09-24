@@ -26,6 +26,12 @@ export type DecisionEntry = {
   summary: string;
   conf?: number;
   side?: Side;
+  /** Gamma event slug the decision applies to, when known. */
+  marketSlug?: string;
+  /** Slug-derived asset id ("btc"). */
+  assetId?: string;
+  /** Slug-derived timeframe id ("5m"). */
+  timeframeId?: string;
 };
 
 const MAX_ACT = 48;

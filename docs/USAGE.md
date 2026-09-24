@@ -26,25 +26,37 @@ Env knobs:
 |-----|---------|---------|
 | `TYPESAFE_API_KEY` | — | Required for real Jev; fail-loud if missing |
 | `POLYMARKET_SOURCE` | `auto` | `live` \| `fixture` \| `auto` |
+| `ASSETS` | `btc,eth,sol,xrp,doge,bnb` | Coins to scan |
+| `TIMEFRAMES` | `5m,15m` | Window lengths to scan |
 | `BTC_UPDOWN_SLUG` | (series resolve) | Optional Gamma event slug override |
-| `TICK_MS` | `15000` | Loop interval |
-| `ACT_THRESHOLD` | `0.80` | Confidence gate (encoded in types; override for experiments) |
+| `TICK_MS` | `5000` | Loop interval |
+| `ACT_THRESHOLD` | `0.90` | Confidence gate (encoded in types; override for experiments) |
 | `BET_USD` | `5` | Max USD notional per ENTER |
+| `BANKROLL_USD` / `KELLY_FRACTION` | `100` / `0.25` | Fractional-Kelly sizing |
+| `MAX_SPREAD` | `0.02` | Reject wide books |
+| `MIN_VOL_PCT` / `REQUIRE_TREND_HELD_SEC` | `0.02` / `60` | Analyze-stage skip filters |
+| `ENFORCE_STRATEGY` / `REQUIRE_BIAS_AGREEMENT` | `1` / `1` | Gate entries on the analysis |
+| `TAKE_PROFIT_PRICE` | `0.90` | Sell open position at this bid (0 = off) |
 
 ## Mental model
 
-Callers talk to **one** object: `WatchSession`.
+Callers talk to **one** object: `WindowSession` (alias `WatchSession`).
 
 ```
-SpotActor ──┐
-            ├── composeFacts() ──► Jev ──► gate ──► DryRunPen (log only)
-MarketActor ┘                              │
-                                           └── TickSnapshot ──► Ink TUI
+feeds[spec] (market+spot)
+        │
+        ▼
+scanner.rankCandidates ──► analysis.analyzeWindow
+        │
+        ▼
+composeFacts() ──► Jev ──► policy.planTrade ──► executor / DryRunPen
+        │
+        └──► TickSnapshot ──► Ink TUI / web
 ```
 
-Each actor keeps **its own latest sample**. Composition happens at the read boundary inside `session.tick()` — nothing shared-mutable across actors.
-
-Wire types (Gamma JSON, CLOB book rows, Binance klines) die inside adapters. Domain + TUI never see them.
+Each spec keeps **its own latest market + spot sample**. The scanner ranks all of
+them; only the best eligible window goes through composition + Jev. Wire types
+(Gamma JSON, CLOB book rows, Binance klines) die inside adapters.
 
 ---
 
@@ -133,5 +145,5 @@ assert(pen.entries[0].side === "BUY");
 ## What you do *not* call
 
 - No `ClobClient.createAndPostOrder` — there is no write client in the dependency graph.
-- No raw Gamma URLs from app code — only `MarketSource.pullActiveBtcUpDown()`.
+- No raw Gamma URLs from app code — only `MarketSource.pullActive(spec)`.
 - No assembling Jev `state` in the TUI — state is composed inside `WatchSession.tick()`.
