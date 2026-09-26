@@ -7,7 +7,7 @@ import { fixedSpotSource } from "./adapters/binance/fixed.js";
 import { typeSafeJudge } from "./adapters/jev/typesafe.js";
 import { stubJudge } from "./adapters/jev/stub.js";
 import { applyDry } from "./broker/dry.js";
-import { LiveBroker } from "./broker/live.js";
+import { LiveBroker, liveBrokerOptionsFromEnv } from "./broker/live.js";
 import { logPen } from "./dryrun/log-pen.js";
 import { defaultPnLPath } from "./pnl/ledger.js";
 import {
@@ -48,6 +48,8 @@ export type EnvBag = {
   FIXTURE_PATH?: string;
   STALE_AFTER_MS?: string;
   LIVE_TRADING?: string;
+  LIVE_TRADING_CONFIRM?: string;
+  LIVE_MAX_ORDER_USD?: string;
   PNL_PATH?: string;
   WALLET_PVK?: string;
   POLYMARKET_FUNDER?: string;
@@ -98,7 +100,7 @@ export function loadConfig(
     e.FIXTURE_PATH ?? "fixtures/btc-updown-active.json",
   );
   const threshold = num(e.ACT_THRESHOLD, 0.9);
-  const betUsd = num(e.BET_USD, 5);
+  let betUsd = num(e.BET_USD, 5);
   const maxAsk = num(e.MAX_ASK, 0.7);
   const minEdge = num(e.MIN_EDGE, 0.1);
   const minSecondsToEnter = Math.max(0, Math.floor(num(e.MIN_SECONDS_TO_ENTER, 90)));
@@ -126,10 +128,47 @@ export function loadConfig(
   const staleAfterMs = num(e.STALE_AFTER_MS, 120_000);
   const liveTrading = e.LIVE_TRADING === "1" || e.LIVE_TRADING === "true";
   const sourceName = (e.POLYMARKET_SOURCE ?? "auto").toLowerCase();
-  if (liveTrading && sourceName === "fixture") {
-    throw new Error(
-      "Refusing LIVE_TRADING with POLYMARKET_SOURCE=fixture (fake token IDs)",
-    );
+  let signatureType = 3;
+  let liveMaxOrderUsd = 5;
+  if (liveTrading) {
+    if (e.LIVE_TRADING_CONFIRM !== "I_ACCEPT_REAL_MONEY_RISK") {
+      throw new Error(
+        "LIVE_TRADING requires LIVE_TRADING_CONFIRM=I_ACCEPT_REAL_MONEY_RISK",
+      );
+    }
+    if (sourceName !== "live") {
+      throw new Error(
+        "Refusing LIVE_TRADING unless POLYMARKET_SOURCE=live (auto can fall back to fixture markets)",
+      );
+    }
+    const rawSignatureType = e.SIGNATURE_TYPE?.trim();
+    if (!rawSignatureType) {
+      throw new Error(
+        "LIVE_TRADING requires SIGNATURE_TYPE matching your Polymarket wallet (0=EOA, 1=Proxy, 2=Safe, 3=Deposit Wallet)",
+      );
+    }
+    signatureType = Number(rawSignatureType);
+    if (!Number.isInteger(signatureType) || signatureType < 0 || signatureType > 3) {
+      throw new Error("SIGNATURE_TYPE must be 0, 1, 2, or 3");
+    }
+    const walletKey = e.WALLET_PVK?.trim();
+    if (!walletKey || !/^(0x)?[0-9a-fA-F]{64}$/.test(walletKey)) {
+      throw new Error("LIVE_TRADING requires WALLET_PVK as a 32-byte hex private key (keep it only in .env)");
+    }
+    const funder = e.POLYMARKET_FUNDER?.trim();
+    if (signatureType === 0 && funder) {
+      throw new Error("Do not set POLYMARKET_FUNDER for SIGNATURE_TYPE=0 (EOA)");
+    }
+    if (signatureType !== 0 && !/^0x[0-9a-fA-F]{40}$/.test(funder ?? "")) {
+      throw new Error(
+        "SIGNATURE_TYPE 1, 2, or 3 requires POLYMARKET_FUNDER to be the matching Polymarket account wallet address",
+      );
+    }
+    liveMaxOrderUsd = num(e.LIVE_MAX_ORDER_USD, 5);
+    if (!(liveMaxOrderUsd > 0)) {
+      throw new Error("LIVE_MAX_ORDER_USD must be greater than 0");
+    }
+    betUsd = Math.min(betUsd, liveMaxOrderUsd);
   }
   const pnlPath = resolve(e.PNL_PATH ?? defaultPnLPath());
 
@@ -187,14 +226,7 @@ export function loadConfig(
   if (opts.overrides?.executor) {
     executor = opts.overrides.executor;
   } else if (liveTrading) {
-    const pk = e.WALLET_PVK?.trim();
-    if (!pk) throw new Error("LIVE_TRADING=1 requires WALLET_PVK");
-    const live = new LiveBroker({
-      privateKey: pk,
-      funderAddress: e.POLYMARKET_FUNDER?.trim(),
-      rpcUrl: e.POLYGON_RPC_URL,
-      signatureType: num(e.SIGNATURE_TYPE, 3),
-    });
+    const live = new LiveBroker(liveBrokerOptionsFromEnv(env as NodeJS.ProcessEnv));
     executor = {
       apply: (position, action, market, at) =>
         live.apply(position, action, market, at),
@@ -231,7 +263,7 @@ export function loadConfig(
     staleAfterMs: opts.overrides?.staleAfterMs ?? staleAfterMs,
     windowLengthSec: opts.overrides?.windowLengthSec ?? 300,
     pnlPath: opts.overrides?.pnlPath ?? pnlPath,
-    liveTrading: opts.overrides?.liveTrading ?? liveTrading,
+    liveTrading,
     executor,
   };
 }

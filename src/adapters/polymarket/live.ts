@@ -12,6 +12,7 @@ import {
   fetchJson,
   type ClobSideQuotes,
   type GammaEventWire,
+  type GammaMarketWire,
 } from "./wire.js";
 
 const GAMMA = "https://gamma-api.polymarket.com";
@@ -124,8 +125,9 @@ function priceLevels(raw: unknown): number[] {
 async function sampleForSlug(
   slug: string,
   light = false,
+  eventOverride?: GammaEventWire,
 ): Promise<Sample<DomainMarket>> {
-  const event = await resolveEvent(slug);
+  const event = eventOverride ?? (await resolveEvent(slug));
   const market = event.markets?.[0];
   if (!market) throw new Error("live gamma: empty markets");
 
@@ -157,6 +159,29 @@ async function sampleForSlug(
     freshness: { pulledAt: asIsoTime(pulledAt), ageMs: 0 },
     source: "live",
   };
+}
+
+/** Fetch a precise Gamma market slug before falling back to event resolution. */
+export async function liveMarketBySlug(slug: string): Promise<Sample<DomainMarket>> {
+  const markets = await fetchJson(
+    `${GAMMA}/markets?slug=${encodeURIComponent(slug)}`,
+  );
+  if (Array.isArray(markets)) {
+    const market = (markets as GammaMarketWire[]).find(
+      (candidate) =>
+        "slug" in candidate &&
+        String((candidate as GammaMarketWire & { slug?: string }).slug) === slug,
+    );
+    if (market) {
+      const event: GammaEventWire = {
+        slug,
+        title: market.question,
+        markets: [market],
+      };
+      return sampleForSlug(slug, true, event);
+    }
+  }
+  return sampleForSlug(slug, true);
 }
 
 export function liveMarketSource(opts: {

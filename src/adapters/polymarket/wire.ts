@@ -8,6 +8,7 @@ import {
 import { parseUpDownSlug } from "../../assets.js";
 
 export type GammaMarketWire = {
+  slug?: string;
   question?: string;
   conditionId?: string;
   condition_id?: string;

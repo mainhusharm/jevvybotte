@@ -39,10 +39,9 @@ TYPESAFE_API_KEY=xyz npm run once
 |----------|-----------|----------------|
 | `TYPESAFE_API_KEY` | Any real judgment (non-`--stub-judge`) | Someone spends your TypeSafe quota |
 | `WALLET_PVK` | `LIVE_TRADING=1` only | **Total loss of funds in that wallet** |
-| `POLYMARKET_FUNDER` | `LIVE_TRADING=1` only | Public address; low risk |
+| `POLYMARKET_FUNDER` | `LIVE_TRADING=1` for Proxy/Safe/Deposit Wallet types | Public address; low risk |
 
-`WALLET_PVK` is a raw private key. Use a dedicated, low-balance wallet — never a
-wallet holding anything you care about.
+`WALLET_PVK` is a raw private key. Use a dedicated, low-balance signer wallet — never a wallet holding anything you care about. For live trading, `LIVE_TRADING_CONFIRM=I_ACCEPT_REAL_MONEY_RISK` is also required, and `LIVE_MAX_ORDER_USD` caps each order. The bot must use `POLYMARKET_SOURCE=live`; it will not use fixtures as order inputs.
 
 ## Verify nothing is exposed before you commit
 

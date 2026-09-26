@@ -10,8 +10,6 @@ import {
   SignatureTypeV2,
   type OrderResponse,
 } from "@polymarket/clob-client-v2";
-import { createSecureClient } from "@polymarket/client";
-import { privateKey } from "@polymarket/client/viem";
 import type {
   DomainMarket,
   IntendedOrder,
@@ -23,16 +21,92 @@ import { applyDry } from "./dry.js";
 
 export type LiveBrokerOpts = {
   privateKey: string;
-  /** Deposit wallet funder. If omitted, resolved via SecureClient. */
+  /** Account wallet address for Proxy, Safe, or Deposit Wallet accounts. */
   funderAddress?: string;
   rpcUrl?: string;
-  signatureType?: number;
+  signatureType: number;
+  maxOrderUsd: number;
 };
 
-const SLIPPAGE = 0.03;
+export function liveBrokerOptionsFromEnv(env: NodeJS.ProcessEnv): LiveBrokerOpts {
+  const privateKey = env.WALLET_PVK?.trim();
+  if (!privateKey || !/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey)) {
+    throw new Error("Live trading requires WALLET_PVK as a 32-byte hex private key (keep it only in .env)");
+  }
+  const signatureType = Number(env.SIGNATURE_TYPE);
+  if (!Number.isInteger(signatureType) || signatureType < 0 || signatureType > 3) {
+    throw new Error("Live trading requires SIGNATURE_TYPE=0 (EOA), 1 (Proxy), 2 (Safe), or 3 (Deposit Wallet)");
+  }
+  const funderAddress = env.POLYMARKET_FUNDER?.trim();
+  if (signatureType === 0 && funderAddress) {
+    throw new Error("Do not set POLYMARKET_FUNDER for SIGNATURE_TYPE=0 (EOA)");
+  }
+  if (signatureType !== 0 && !/^0x[0-9a-fA-F]{40}$/.test(funderAddress ?? "")) {
+    throw new Error("POLYMARKET_FUNDER must be your Polymarket account wallet address for this signature type");
+  }
+  const maxOrderUsd = Number(env.LIVE_MAX_ORDER_USD ?? "5");
+  if (!Number.isFinite(maxOrderUsd) || maxOrderUsd <= 0) {
+    throw new Error("LIVE_MAX_ORDER_USD must be a finite value greater than 0");
+  }
+  return {
+    privateKey,
+    funderAddress,
+    rpcUrl: env.POLYGON_RPC_URL,
+    signatureType,
+    maxOrderUsd,
+  };
+}
 
-function roundPrice(p: number): number {
-  return Math.round(p * 100) / 100;
+const MAX_SLIPPAGE_FRACTION = 0.03;
+const MIN_PRICE = 0.01;
+const MAX_PRICE = 0.99;
+
+function floorCents(amount: number): number {
+  return Math.floor((amount + Number.EPSILON) * 100) / 100;
+}
+
+/** Unrounded maximum FOK price permitted by the relative slippage protection. */
+export function fokPriceCeiling(
+  order: IntendedOrder,
+  slippageFraction = MAX_SLIPPAGE_FRACTION,
+): number {
+  if (!Number.isFinite(order.price) || order.price <= 0 || order.price >= 1) {
+    throw new Error("Order price must be finite and between 0 and 1");
+  }
+  if (!Number.isFinite(slippageFraction) || slippageFraction < 0 || slippageFraction > 1) {
+    throw new Error("FOK slippage fraction must be between 0 and 1");
+  }
+  const ceiling = order.side === "BUY"
+    ? Math.min(MAX_PRICE, order.price * (1 + slippageFraction))
+    : Math.max(MIN_PRICE, order.price * (1 - slippageFraction));
+  return Number(ceiling.toFixed(8));
+}
+
+/** Tick-aligned FOK limit with at most 3% relative price protection. */
+export function fokLimitPrice(
+  order: IntendedOrder,
+  tickSize: string | number,
+  slippageFraction = MAX_SLIPPAGE_FRACTION,
+): number {
+  const tick = Number(tickSize);
+  if (!Number.isFinite(tick) || tick <= 0 || tick > 1) {
+    throw new Error(`Invalid CLOB tick size: ${String(tickSize)}`);
+  }
+  const rawLimit = fokPriceCeiling(order, slippageFraction);
+  const tickCount = order.side === "BUY"
+    ? Math.floor((rawLimit + Number.EPSILON) / tick)
+    : Math.ceil((rawLimit - Number.EPSILON) / tick);
+  const limit = Number((tickCount * tick).toFixed(8));
+  if (limit < MIN_PRICE || limit > MAX_PRICE) {
+    throw new Error(`FOK limit price ${limit} is outside the tradable price range`);
+  }
+  if (order.side === "BUY" && limit < order.price) {
+    throw new Error("FOK tick size cannot represent a BUY limit at or above the quoted ask");
+  }
+  if (order.side === "SELL" && limit > order.price) {
+    throw new Error("FOK tick size cannot represent a SELL limit at or below the quoted bid");
+  }
+  return limit;
 }
 
 /** True when the CLOB response shows an immediate match / fill. */
@@ -70,29 +144,66 @@ export function withFillAmounts(
   return order;
 }
 
-function worstPrice(order: IntendedOrder): number {
-  if (order.side === "BUY") {
-    return Math.min(0.99, roundPrice(order.price + SLIPPAGE));
+export function liveOrderBudgetUsd(order: IntendedOrder): number {
+  if (order.side !== "BUY") return 0;
+  if (!Number.isFinite(order.size) || order.size <= 0 || !Number.isFinite(order.price) || order.price <= 0) {
+    return 0;
   }
-  return Math.max(0.01, roundPrice(order.price - SLIPPAGE));
+  // Polymarket CLOB v2 market BUY `amount` is collateral (USDC), rounded down
+  // to cents so floating-point rounding can never cross the configured cap.
+  return floorCents(order.size * order.price);
+}
+
+export function marketBuyRequest(
+  order: IntendedOrder,
+  maxOrderUsd: number,
+  tickSize: string | number,
+): {
+  tokenID: string;
+  side: typeof ClobSide.BUY;
+  amount: number;
+  price: number;
+  userUSDCBalance: number;
+} {
+  if (order.side !== "BUY") throw new Error("Market buy request requires a BUY order");
+  if (!Number.isFinite(maxOrderUsd) || maxOrderUsd <= 0) {
+    throw new Error("LIVE_MAX_ORDER_USD must be a finite value greater than 0");
+  }
+  const amount = liveOrderBudgetUsd(order);
+  if (!(amount > 0) || amount > maxOrderUsd) {
+    throw new Error(`Refusing BUY order: estimated notional $${amount.toFixed(2)} exceeds LIVE_MAX_ORDER_USD=$${maxOrderUsd.toFixed(2)} or is invalid`);
+  }
+  return {
+    tokenID: order.tokenId,
+    side: ClobSide.BUY,
+    amount,
+    price: fokLimitPrice(order, tickSize),
+    // SDK treats this as the collateral budget available for order+fees, and
+    // reduces the USDC order amount if its estimated fees would exceed it.
+    userUSDCBalance: maxOrderUsd,
+  };
 }
 
 function marketAmount(order: IntendedOrder): number {
-  if (order.side === "BUY") {
-    return Math.round(order.size * order.price * 100) / 100;
-  }
+  if (order.side === "BUY") return liveOrderBudgetUsd(order);
   return order.size;
 }
 
 /**
  * Posts FOK market orders via CLOB v2. Position updates only on fill.
- * Resting GTC leftovers are cancelled once when the client is built.
+ * No unrelated account orders are cancelled by this broker.
  */
 export class LiveBroker {
   private clientPromise: Promise<ClobClient> | null = null;
   private readonly opts: LiveBrokerOpts;
 
   constructor(opts: LiveBrokerOpts) {
+    if (!Number.isInteger(opts.signatureType) || opts.signatureType < 0 || opts.signatureType > 3) {
+      throw new Error("SIGNATURE_TYPE must be 0, 1, 2, or 3");
+    }
+    if (!(opts.maxOrderUsd > 0) || !Number.isFinite(opts.maxOrderUsd)) {
+      throw new Error("LIVE_MAX_ORDER_USD must be a finite value greater than 0");
+    }
     this.opts = opts;
   }
 
@@ -115,20 +226,23 @@ export class LiveBroker {
       transport: http(rpc),
     });
 
-    let funder = this.opts.funderAddress?.trim();
-    if (!funder) {
-      const secure = await createSecureClient({ signer: privateKey(key) });
-      funder = secure.account.wallet;
+    const funder = this.opts.funderAddress?.trim();
+    const sig = [
+      SignatureTypeV2.EOA,
+      SignatureTypeV2.POLY_PROXY,
+      SignatureTypeV2.POLY_GNOSIS_SAFE,
+      SignatureTypeV2.POLY_1271,
+    ][this.opts.signatureType];
+    if (sig == null) throw new Error("Invalid Polymarket signature type");
+    if (this.opts.signatureType === 0 && funder) {
+      throw new Error("Do not set a funder address for an EOA wallet");
     }
-
-    const sig =
-      this.opts.signatureType === 0
-        ? SignatureTypeV2.EOA
-        : this.opts.signatureType === 1
-          ? SignatureTypeV2.POLY_PROXY
-          : this.opts.signatureType === 2
-            ? SignatureTypeV2.POLY_GNOSIS_SAFE
-            : SignatureTypeV2.POLY_1271;
+    if (
+      this.opts.signatureType !== 0 &&
+      !/^0x[0-9a-fA-F]{40}$/.test(funder ?? "")
+    ) {
+      throw new Error("A valid POLYMARKET_FUNDER account wallet is required for this signature type");
+    }
 
     const auth = new ClobClient({
       host: "https://clob.polymarket.com",
@@ -146,13 +260,6 @@ export class LiveBroker {
       throwOnError: true,
     });
     await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    try {
-      await client.cancelAll();
-      console.error("[live] cancelled resting open orders (clear GTC leftovers)");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[live] cancelAll skipped: ${msg}`);
-    }
     return client;
   }
 
@@ -164,18 +271,40 @@ export class LiveBroker {
     const tickSize = await client.getTickSize(tokenID);
     const negRisk = await client.getNegRisk(tokenID);
     const side = order.side === "BUY" ? ClobSide.BUY : ClobSide.SELL;
-    const amount = marketAmount(order);
-    const price = worstPrice(order);
+    const marketOrder = order.side === "BUY"
+      ? marketBuyRequest(order, this.opts.maxOrderUsd, tickSize)
+      : {
+          tokenID,
+          side,
+          amount: marketAmount(order),
+          price: fokLimitPrice(order, tickSize),
+        };
     return client.createAndPostMarketOrder(
-      {
-        tokenID,
-        side,
-        amount,
-        price,
-      },
+      marketOrder,
       { tickSize, negRisk },
       OrderType.FOK,
     );
+  }
+
+  async placeBuy(
+    order: IntendedOrder,
+  ): Promise<{ filled: boolean; order: IntendedOrder | null; status: string; orderId: string | null }> {
+    if (order.side !== "BUY") throw new Error("MCP live trading only supports BUY orders");
+    const usdNotional = liveOrderBudgetUsd(order);
+    if (!(usdNotional > 0) || usdNotional > this.opts.maxOrderUsd) {
+      throw new Error(
+        `Refusing BUY order: estimated notional $${usdNotional.toFixed(2)} exceeds LIVE_MAX_ORDER_USD=$${this.opts.maxOrderUsd.toFixed(2)} or is invalid`,
+      );
+    }
+    const client = await this.client();
+    const response = await this.postFok(client, order);
+    const filled = orderFilled(response);
+    return {
+      filled,
+      order: filled ? withFillAmounts(order, response) : null,
+      status: String(response.status ?? (filled ? "matched" : "no_fill")),
+      orderId: response.orderID || null,
+    };
   }
 
   async apply(
@@ -187,6 +316,17 @@ export class LiveBroker {
     const planned = applyDry(position, action, market, at);
     if (planned.orders.length === 0) {
       return { position, orders: [], responses: [] };
+    }
+
+    for (const order of planned.orders) {
+      // Entry orders add exposure; exits only reduce the position opened by this bot.
+      if (order.side !== "BUY") continue;
+      const usdNotional = liveOrderBudgetUsd(order);
+      if (!(usdNotional > 0) || usdNotional > this.opts.maxOrderUsd) {
+        throw new Error(
+          `Refusing BUY order: estimated notional $${usdNotional.toFixed(2)} exceeds LIVE_MAX_ORDER_USD=$${this.opts.maxOrderUsd.toFixed(2)} or is invalid`,
+        );
+      }
     }
 
     const client = await this.client();
